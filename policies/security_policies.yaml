@@ -1,0 +1,47 @@
+# SecOps Orchestrator - Security Policy Configuration
+
+policies:
+  - name: "critical_sast_gate"
+    description: "Fail build if critical SAST findings > 0"
+    type: "sast"
+    severity: "CRITICAL"
+    action: "block"
+    enabled: true
+
+  - name: "no_critical_sca"
+    description: "Block deployment if known vulnerable dependencies exist"
+    type: "sca"
+    severity: "CRITICAL"
+    action: "block"
+    enabled: true
+
+  - name: "high_sast_limit"
+    description: "Alert if high severity SAST findings > 5"
+    type: "sast"
+    severity: "HIGH"
+    threshold: 5
+    action: "alert"
+    enabled: true
+
+  - name: "iac_compliance"
+    description: "Require IaC scans before deployment"
+    type: "iac"
+    action: "require_scan"
+    enabled: true
+
+projects:
+  - name: "webapp"
+    branches:
+      - main
+      - develop
+    scanners:
+      - sast: "semgrep"
+      - sca: "snyk"
+      - iac: "checkov"
+
+  - name: "api"
+    branches:
+      - main
+    scanners:
+      - sast: "sonarqube"
+      - sca: "npm audit"
