@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -9,8 +10,16 @@ from sqlalchemy.orm import sessionmaker
 import json
 import time
 from contextlib import asynccontextmanager
+import jwt
+from passlib.context import CryptContext
 
 DATABASE_URL = "postgresql://user:password@db:5432/secops_db"
+
+SECRET_KEY = "secops-orchestrator-super-secret-key-xyz-123"
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
 
 # Initialize engine lazily to avoid startup errors
 engine = None
@@ -28,6 +37,15 @@ class Vulnerability(Base):
     repository = Column(String)
     branch = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String, default="developer")  # admin, developer, auditor
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +79,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_jwt_token(data: dict) -> str:
+    to_encode = data.copy()
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_jwt_token(token: str) -> Optional[dict]:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        return None
+
+class UserSignup(BaseModel):
+    username: str
+    email: str
+    password: str
+    role: str = "developer"
+
+class UserSignin(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    role: str
+
+    class Config:
+        from_attributes = True
+
 class ScanResult(BaseModel):
     scanner: str
     timestamp: str
@@ -80,6 +133,42 @@ class FeedbackRequest(BaseModel):
     platform: str  # jira, github
     issue_url: str
     remediation_advice: str
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserResponse:
+    token = credentials.credentials
+    payload = decode_jwt_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return UserResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            role=user.role
+        )
+    finally:
+        db.close()
+
+class RoleChecker:
+    def __init__(self, allowed_roles: List[str]):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, current_user: UserResponse = Depends(get_current_user)):
+        if current_user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Operation not permitted. Required roles: {self.allowed_roles}. Your role: {current_user.role}"
+            )
+        return current_user
 
 # API Endpoints
 @app.post("/scan-results/")
@@ -104,8 +193,63 @@ async def ingest_scan_results(result: ScanResult):
     finally:
         db.close()
 
+@app.post("/auth/signup", response_model=UserResponse)
+async def signup(user_in: UserSignup):
+    db = SessionLocal()
+    try:
+        existing_user = db.query(User).filter((User.username == user_in.username) | (User.email == user_in.email)).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username or email already registered")
+        
+        if user_in.role not in ["admin", "developer", "auditor"]:
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'admin', 'developer', or 'auditor'")
+
+        new_user = User(
+            username=user_in.username,
+            email=user_in.email,
+            hashed_password=hash_password(user_in.password),
+            role=user_in.role
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        return new_user
+    finally:
+        db.close()
+
+@app.post("/auth/signin")
+async def signin(user_in: UserSignin):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == user_in.username).first()
+        if not user or not verify_password(user_in.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
+        
+        token = create_jwt_token({"sub": user.username, "role": user.role})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role
+            }
+        }
+    finally:
+        db.close()
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: UserResponse = Depends(get_current_user)):
+    return current_user
+
+
 @app.get("/dashboard/vulnerabilities/")
-async def get_dashboard_vulnerabilities(severity: Optional[str] = None, project: Optional[str] = None):
+async def get_dashboard_vulnerabilities(
+    severity: Optional[str] = None, 
+    project: Optional[str] = None,
+    current_user: UserResponse = Depends(get_current_user)
+):
     db = SessionLocal()
     try:
         query = db.query(Vulnerability)
@@ -133,7 +277,7 @@ async def get_dashboard_vulnerabilities(severity: Optional[str] = None, project:
         db.close()
 
 @app.get("/dashboard/stats/")
-async def get_dashboard_stats():
+async def get_dashboard_stats(current_user: UserResponse = Depends(get_current_user)):
     db = SessionLocal()
     try:
         total = db.query(Vulnerability).count()
@@ -168,7 +312,10 @@ async def check_policies(project: str, branch: str):
         db.close()
 
 @app.post("/feedback/")
-async def create_feedback(feedback: FeedbackRequest):
+async def create_feedback(
+    feedback: FeedbackRequest,
+    current_user: UserResponse = Depends(RoleChecker(["admin", "developer"]))
+):
     db = SessionLocal()
     try:
         vuln = db.query(Vulnerability).filter(Vulnerability.id == feedback.vulnerability_id).first()
@@ -185,7 +332,11 @@ async def create_feedback(feedback: FeedbackRequest):
         db.close()
 
 @app.get("/remediation/")
-async def get_remediation_guide(severity: str, vuln_type: str):
+async def get_remediation_guide(
+    severity: str, 
+    vuln_type: str,
+    current_user: UserResponse = Depends(get_current_user)
+):
     # Simplified remediation advice - in production this would pull from OWASP/etc.
     remediation_db = {
         "CRITICAL": {
